@@ -1,100 +1,117 @@
-import time
-import hashlib
-import hmac
-import base64
+"""
+Harold's Eyes — Data Verification Script
+========================================
+Run this to see the exact market data and calculated indicators
+that are sent to the AI before it makes a decision.
+"""
+
 import requests
+import json
+import time
 
-class KrakenFuturesAgent:
-    def __init__(self, api_key, api_secret):
-        self.api_key = api_key
-        self.api_secret = api_secret
-        self.base_url = "https://demo-futures.kraken.com"
+SYMBOL_API = "XBTUSD"
 
-    def _get_signature(self, endpoint_path, nonce, post_data=""):
-        """Generates the mandatory signature for Kraken Futures API v3."""
-        message = post_data + nonce + endpoint_path
-        sha256_hash = hashlib.sha256(message.encode("utf-8")).digest()
-        secret_decoded = base64.b64decode(self.api_secret)
-        hmac_512 = hmac.new(secret_decoded, sha256_hash, hashlib.sha512).digest()
-        return base64.b64encode(hmac_512).decode("utf-8")
-
-    def place_market_order(self, symbol="PI_XBTUSD", side="buy", size=1):
-        """Places a market order via POST."""
-        http_path = "/derivatives/api/v3/sendorder"
-        sign_path = "/api/v3/sendorder"
-        nonce = str(int(time.time() * 1000))
-        order_data = {"orderType": "mkt", "symbol": symbol, "side": side, "size": size}
-        
-        # Format the query string exactly for the signature
-        query_string = f"orderType={order_data['orderType']}&symbol={order_data['symbol']}&side={order_data['side']}&size={order_data['size']}"
-        
-        authent = self._get_signature(sign_path, nonce, post_data=query_string)
-        headers = {
-            "APIKey": self.api_key, 
-            "Authent": authent, 
-            "Nonce": nonce, 
-            "Content-Type": "application/x-www-form-urlencoded"
+# ─── MARKET DATA FETCHERS ──────────────────────────────────────────────────────
+def fetch_ticker() -> dict:
+    """Gets latest price + 24h high/low from Kraken REST API."""
+    try:
+        r = requests.get(
+            "https://api.kraken.com/0/public/Ticker",
+            params={"pair": SYMBOL_API},
+            timeout=10,
+        )
+        r.raise_for_status()
+        t = list(r.json()["result"].values())[0]
+        return {
+            "price":  float(t["c"][0]),
+            "high24": float(t["h"][1]),
+            "low24":  float(t["l"][1]),
         }
-        return requests.post(self.base_url + http_path, data=order_data, headers=headers).json()
+    except Exception as e:
+        print(f"❌ Ticker fetch failed: {e}")
+        return {"price": 0.0, "high24": 0.0, "low24": 0.0}
 
-    def get_pnl(self, entry_price, size, symbol="PI_XBTUSD"):
-        """Calculates current PnL percentage."""
-        response = requests.get(self.base_url + "/derivatives/api/v3/tickers").json()
-        # Find the specific symbol in the ticker list
-        current_price = next(t['last'] for t in response['tickers'] if t['symbol'] == symbol)
+def fetch_ohlc_with_retry(interval: int = 1, max_attempts: int = 3) -> list:
+    """Fetches 1-minute OHLC candles with retry logic."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            r = requests.get(
+                "https://api.kraken.com/0/public/OHLC",
+                params={"pair": SYMBOL_API, "interval": interval},
+                timeout=15,
+            )
+            r.raise_for_status()
+            candles = r.json()["result"].get("XXBTZUSD", [])
+            if candles:
+                return candles
+            print(f"⚠️ OHLC returned empty list (attempt {attempt}/{max_attempts})")
+        except Exception as e:
+            print(f"⚠️ OHLC fetch attempt {attempt}/{max_attempts} failed: {e}")
         
-        pnl_usd = (current_price - entry_price) * (size / entry_price)
-        percent = (pnl_usd / (size / entry_price)) * 100
-        return {"current_price": current_price, "percent": round(percent, 2)}
-
-    def start_trading(self, symbol="PI_XBTUSD", size=50, tp=0.5, sl=-0.2):
-        """Main automated trading loop."""
-        print(f"🚀 Initializing Agent: Buying {size} units of {symbol}...")
-        
-        # 1. Place the entry order
-        res = self.place_market_order(symbol=symbol, side="buy", size=size)
+        if attempt < max_attempts:
+            time.sleep(2 ** attempt)  
     
-        if res.get('result') == 'success':
-            # 2. Extract price and size from the execution event
-            exec_data = res['sendStatus']['orderEvents'][0]
-            entry_p = exec_data['price']
-            qty = exec_data['amount']
-            print(f"✅ Position Open @ ${entry_p}")
+    print("❌ All OHLC fetch attempts failed.")
+    return []
 
-            try:
-                print(f"--- Monitoring {symbol} (Updates every 1s) ---")
-                while True:
-                    # 3. Fetch PnL using the correct symbol
-                    stats = self.get_pnl(entry_p, qty, symbol=symbol)
-                    pnl = stats['percent']
-                    
-                    print(f"[{time.strftime('%H:%M:%S')}] {symbol} Price: ${stats['current_price']} | PnL: {pnl}%")
+# ─── SIGNAL ENGINE ─────────────────────────────────────────────────────────────
+def build_signals(ticker: dict, ohlc: list) -> dict:
+    """Calculates technical indicators for 1-minute charts."""
+    price = ticker["price"]
 
-                    if pnl >= tp:
-                        print(f"\n💰 Target Hit (+{pnl}%)! Selling...")
-                        break
-                    elif pnl <= sl:
-                        print(f"\n⚠️ Stop Loss Hit ({pnl}%)! Selling...")
-                        break
-                    
-                    time.sleep(10)  # Check every 10 seconds
+    if not ohlc or price == 0.0:
+        return {"price": price, "error": "No candle data available"}
 
-                # 4. Close the position
-                self.place_market_order(symbol=symbol, side="sell", size=qty)
-                print("✅ Trade Closed Successfully.")
-                
-            except KeyboardInterrupt:
-                print("\nManual Exit: Closing position for safety...")
-                self.place_market_order(symbol=symbol, side="sell", size=qty)
-        else:
-            print(f"❌ Entry Failed: {res}")
+    closes  = [float(c[4]) for c in ohlc]
+    volumes = [float(c[6]) for c in ohlc]
 
+    # Fast Moving Averages
+    sma_10m = sum(closes[-10:]) / 10 if len(closes) >= 10 else None
+    sma_30m = sum(closes[-30:]) / 30 if len(closes) >= 30 else None
+
+    # Momentum: count up vs down moves over last 5 candles
+    recent = closes[-5:]
+    ups   = sum(1 for i in range(1, len(recent)) if recent[i] > recent[i - 1])
+    downs = sum(1 for i in range(1, len(recent)) if recent[i] < recent[i - 1])
+    momentum = "up" if ups >= 3 else ("down" if downs >= 3 else "flat")
+
+    # Volume spike: last candle vs 20-candle average
+    last_vol = volumes[-1] if volumes else 0
+    avg_vol  = sum(volumes[-20:]) / min(20, len(volumes)) if volumes else 1
+    vol_spike = bool(last_vol > avg_vol * 1.5)
+
+    # Last 5 closes as price history for the AI prompt
+    recent_closes = [round(c, 2) for c in closes[-5:]]
+
+    return {
+        "price":          price,
+        "sma_10m":        round(sma_10m, 2) if sma_10m else None,
+        "sma_30m":        round(sma_30m, 2) if sma_30m else None,
+        "above_sma_10m":  bool(sma_10m and price > sma_10m),
+        "above_sma_30m":  bool(sma_30m and price > sma_30m),
+        "momentum":       momentum,
+        "volume_spike":   vol_spike,
+        "recent_closes":  recent_closes,
+    }
+
+# ─── EXECUTION ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # Add your credentials here
-    KEY = "0G9tweA0qw6RjIbyEktfCZkLtuoe0JVBhEWuYxP2ldjUOLy4Y4V2QQdp"
-    SECRET = "i0L/mBkA9Tag2NnI7h5qUj51/6KBUqpUmr9nkJ3xIAhO52AfP1YVUfvYsDJFnT3MPCs+9Cr/YVaneC2pB43dOSUR"
+    print("Fetching live market data from Kraken...")
     
-    agent = KrakenFuturesAgent(KEY, SECRET)
+    ticker = fetch_ticker()
+    print(f"✅ Ticker fetched. Current Price: ${ticker['price']:,.2f}")
     
-    # Example: Trade Bitcoin with a 0.2% Profit Target and 0.1% Stop Loss
-    agent.start_trading(symbol="PI_XBTUSD", size=50, tp=0.2, sl=-0.1)
+    ohlc = fetch_ohlc_with_retry()
+    print(f"✅ OHLC fetched. Total candles: {len(ohlc)}")
+    
+    if ticker["price"] > 0 and ohlc:
+        signals = build_signals(ticker, ohlc)
+        
+        print("\n" + "━"*50)
+        print(" EXACT JSON PAYLOAD FED TO GROQ AI")
+        print("━"*50)
+        # We use json.dumps with an indent of 4 to make it highly readable in the terminal
+        print(json.dumps(signals, indent=4))
+        print("━"*50 + "\n")
+    else:
+        print("❌ Failed to gather enough data to build signals.")
