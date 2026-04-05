@@ -32,13 +32,13 @@ groq_client = Groq(api_key=GROQ_KEY)
 SYMBOL_CLI = "BTCUSD"    # Used for Kraken CLI execution
 SYMBOL_API = "XBTUSD"   # Used for Kraken REST API data fetching
 
-# Safety net percentages
-TAKE_PROFIT = 0.80     # Close trade at +1.5% PnL
-STOP_LOSS   = -0.4     # Close trade at -1.2% PnL
+# Safety net percentages (kraken fees is ~0.26% for our volume tier, so these are set wide enough to account for that and some volatility)
+TAKE_PROFIT = 0.650     # Close trade at +1.5% PnL
+STOP_LOSS   = -0.2    # Close trade at -1.2% PnL
 
 # Timing
-AI_CYCLE_SEC     = 120   # How often Groq makes a decision
-MONITOR_SEC      = 20    # How often the status monitor ticks
+AI_CYCLE_SEC     = 180  # How often Groq makes a decision
+MONITOR_SEC      = 15   # How often the status monitor ticks
 
 # Files
 STATE_FILE = "harold_state.json"
@@ -520,6 +520,7 @@ def run():
                     res = paper_sell(SYMBOL_CLI, position["size"])
                     if res:
                         log.info("Position closed successfully. State cleared.")
+                        log_trade_to_csv("SELL(AI)", price, position["size"], decision["reasoning"])
                         save_state(None)
                     else:
                         log.error("Failed to close position on Kraken CLI.")
